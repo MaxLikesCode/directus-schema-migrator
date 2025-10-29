@@ -179,3 +179,10 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+.vscode/
+
+# Directus
+source_schema_snapshot.json
+schema_diff.json
+target_schema_backup.json
+apply_result.json
