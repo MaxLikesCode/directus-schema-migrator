@@ -6,6 +6,7 @@ A Python tool to migrate Directus schemas between instances. Pulls a schema snap
 
 - Python 3.7+
 - `requests` and `python-dotenv` packages
+- PostgreSQL client tools (`pg_dump`, `pg_restore`) if using `--with-data`
 
 ## Quick Start
 
@@ -32,6 +33,10 @@ A Python tool to migrate Directus schemas between instances. Pulls a schema snap
    # DIRECTUS_SOURCE_PASSWORD=password
    # DIRECTUS_TARGET_EMAIL=admin@example.com
    # DIRECTUS_TARGET_PASSWORD=password
+
+   # Optional for --with-data (PostgreSQL content migration)
+   # DIRECTUS_SOURCE_DB_URL=postgres://user:pass@host:5432/source_db
+   # DIRECTUS_TARGET_DB_URL=postgres://user:pass@host:5432/target_db
    ```
 
 3. **Run the migration:**
@@ -45,12 +50,18 @@ A Python tool to migrate Directus schemas between instances. Pulls a schema snap
 
    # Apply without backup
    python migrate.py --no-backup
+
+   # Apply schema and migrate content data (PostgreSQL)
+   # Requires DIRECTUS_SOURCE_DB_URL and DIRECTUS_TARGET_DB_URL and pg_dump/pg_restore
+   python migrate.py --with-data
    ```
 
 ## Options
 
 - `--dry-run` - Show diff only; don't apply changes
 - `--no-backup` - Skip backing up target schema (backup is enabled by default)
+- `--with-data` - Migrate content data using pg_dump/pg_restore (PostgreSQL). Requires
+  `DIRECTUS_SOURCE_DB_URL` and `DIRECTUS_TARGET_DB_URL`, and the `pg_dump`/`pg_restore` binaries.
 - `--timeout N` - HTTP timeout in seconds (default: 30)
 - `--no-verify-ssl` - Disable TLS verification (not recommended)
 - `--pretty` - Pretty-print JSON outputs

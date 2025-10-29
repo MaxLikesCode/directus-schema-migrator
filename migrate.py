@@ -3,7 +3,10 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 from typing import Optional, Tuple
 
 import requests
@@ -27,6 +30,11 @@ def parse_args() -> argparse.Namespace:
         "--no-backup",
         action="store_true",
         help="Skip backing up the target schema before applying.",
+    )
+    p.add_argument(
+        "--with-data",
+        action="store_true",
+        help="Migrate data using pg_dump/pg_restore between databases (content-only).",
     )
     p.add_argument(
         "--timeout", type=int, default=30, help="HTTP timeout in seconds (default: 30)"
@@ -54,6 +62,9 @@ def parse_args() -> argparse.Namespace:
     args.target_token = os.getenv("DIRECTUS_TARGET_TOKEN")
     args.target_email = os.getenv("DIRECTUS_TARGET_EMAIL")
     args.target_password = os.getenv("DIRECTUS_TARGET_PASSWORD")
+    # Optional DB connection URIs for pg_dump mode
+    args.source_db_url = os.getenv("DIRECTUS_SOURCE_DB_URL")
+    args.target_db_url = os.getenv("DIRECTUS_TARGET_DB_URL")
 
     # Validate required environment variables
     if not args.source_url or not args.target_url:
@@ -270,6 +281,134 @@ def write_json(path: str, obj: dict, pretty: bool):
             json.dump(obj, f, ensure_ascii=False, separators=(",", ":"))
 
 
+# pg_dump helpers (Option A - content-only)
+def ensure_binaries_exists(names: list):
+    missing = [n for n in names if shutil.which(n) is None]
+    if missing:
+        raise RuntimeError(
+            f"Missing required binaries: {', '.join(missing)}. Please install PostgreSQL client tools."
+        )
+
+
+def run_pg_dump_data_migration(
+    source_db_url: str,
+    target_db_url: str,
+    jobs: int = 4,
+) -> dict:
+    ensure_binaries_exists(["pg_dump", "pg_restore"])
+
+    # Exclude Directus system tables (shell-style pattern)
+    exclude_args = [
+        "--exclude-table=public.directus_*",
+        "--exclude-table=directus_*",
+    ]
+
+    # Temporary dump file
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".dump")
+    tmp_path = tmp.name
+    tmp.close()
+
+    dump_cmd = [
+        "pg_dump",
+        "-Fc",
+        "--data-only",
+        "--no-owner",
+        "--no-privileges",
+        "-d",
+        source_db_url,
+        "-f",
+        tmp_path,
+    ] + exclude_args
+
+    print("[PG] Running pg_dump (data-only, excluding directus_*)…")
+    res_dump = subprocess.run(dump_cmd, capture_output=True, text=True)
+    if res_dump.returncode != 0:
+        raise RuntimeError(res_dump.stderr.strip() or res_dump.stdout.strip())
+
+    restore_cmd = [
+        "pg_restore",
+        "--data-only",
+        "--no-owner",
+        "--no-privileges",
+        "--disable-triggers",
+        "--jobs",
+        str(jobs),
+        "-d",
+        target_db_url,
+        tmp_path,
+    ]
+    print("[PG] Running pg_restore (data-only)…")
+    res_restore = subprocess.run(restore_cmd, capture_output=True, text=True)
+    if res_restore.returncode != 0:
+        raise RuntimeError(res_restore.stderr.strip() or res_restore.stdout.strip())
+
+    return {"dump_file": tmp_path}
+
+
+def run_pg_dump_selected_tables(
+    source_db_url: str,
+    target_db_url: str,
+    tables: list,
+    jobs: int = 4,
+) -> dict:
+    """Dump and restore selected tables from source to target (data-only).
+
+    Attempts each table individually so missing tables on a given Directus version
+    do not fail the whole process.
+    """
+    ensure_binaries_exists(["pg_dump", "pg_restore"])
+
+    migrated = []
+    skipped_missing = []
+    for table in tables:
+        # Create temp dump per table
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{table}.dump")
+        tmp_path = tmp.name
+        tmp.close()
+
+        dump_cmd = [
+            "pg_dump",
+            "-Fc",
+            "--data-only",
+            "--no-owner",
+            "--no-privileges",
+            "-t",
+            table,
+            "-d",
+            source_db_url,
+            "-f",
+            tmp_path,
+        ]
+
+        res_dump = subprocess.run(dump_cmd, capture_output=True, text=True)
+        if res_dump.returncode != 0:
+            msg = (res_dump.stderr or res_dump.stdout or "").strip()
+            if "No matching tables were found" in msg or "does not exist" in msg:
+                skipped_missing.append(table)
+                continue
+            raise RuntimeError(f"pg_dump for {table} failed: {msg}")
+
+        restore_cmd = [
+            "pg_restore",
+            "--data-only",
+            "--no-owner",
+            "--no-privileges",
+            "--disable-triggers",
+            "--jobs",
+            str(jobs),
+            "-d",
+            target_db_url,
+            tmp_path,
+        ]
+        res_restore = subprocess.run(restore_cmd, capture_output=True, text=True)
+        if res_restore.returncode != 0:
+            msg = (res_restore.stderr or res_restore.stdout or "").strip()
+            raise RuntimeError(f"pg_restore for {table} failed: {msg}")
+        migrated.append(table)
+
+    return {"migrated": migrated, "skipped_missing": skipped_missing}
+
+
 def main():
     args = parse_args()
     verify = not args.no_verify_ssl
@@ -279,6 +418,8 @@ def main():
     print(f"Target: {args.target_url}")
     print(f"Dry-run: {args.dry_run}")
     print(f"Backup target: {not args.no_backup}")
+    if args.with_data:
+        print("Data migration: pg_dump mode (content-only)")
     print()
 
     # Authenticate
@@ -343,7 +484,7 @@ def main():
         sys.exit(0)
 
     # Check if there are any changes to apply
-    if count == 0:
+    if count == 0 and not args.with_data:
         print(
             "\n✅ No schema differences found. Target is already in sync with source."
         )
@@ -362,22 +503,68 @@ def main():
             print("Target backup skipped (see warning above).")
 
     # Apply
-    try:
-        print("[4/4] Applying snapshot to target…")
-        result = apply_snapshot(
-            args.target_url, target_bearer, source_snapshot, args.timeout, verify
-        )
-        result_path = os.path.join(args.outdir, "apply_result.json")
-        write_json(result_path, {"data": result}, args.pretty)
-        print(f"Apply completed. Result saved -> {result_path}")
-        print("\n✅ Schema migration completed successfully.")
-        if backup_path:
-            print(
-                f"ℹ️ A backup of the previous target schema is available at: {backup_path}"
+    if count > 0:
+        try:
+            print("[4/4] Applying snapshot to target…")
+            result = apply_snapshot(
+                args.target_url, target_bearer, source_snapshot, args.timeout, verify
             )
-    except Exception as e:
-        print(f"[ERROR] Failed to apply snapshot on target: {e}")
-        sys.exit(1)
+            result_path = os.path.join(args.outdir, "apply_result.json")
+            write_json(result_path, {"data": result}, args.pretty)
+            print(f"Apply completed. Result saved -> {result_path}")
+            print("\n✅ Schema migration completed successfully.")
+            if backup_path:
+                print(
+                    f"ℹ️ A backup of the previous target schema is available at: {backup_path}"
+                )
+        except Exception as e:
+            print(f"[ERROR] Failed to apply snapshot on target: {e}")
+            sys.exit(1)
+    else:
+        print("\nNo schema changes to apply. Skipping schema migration.")
+
+    # pg_dump data migration (Option A)
+    if args.with_data:
+        if not args.source_db_url or not args.target_db_url:
+            print(
+                "[ERROR] pg_dump mode requires DIRECTUS_SOURCE_DB_URL and DIRECTUS_TARGET_DB_URL in .env"
+            )
+            sys.exit(1)
+        try:
+            print("\n[PG] Starting pg_dump-based content data migration…")
+            pg_result = run_pg_dump_data_migration(
+                args.source_db_url, args.target_db_url
+            )
+            print("[PG] Data migration completed successfully.")
+            if pg_result.get("dump_file"):
+                print(f"[PG] Temporary dump file: {pg_result['dump_file']}")
+
+            # Migrate necessary directus_ tables for a clean experience
+            core_tables = [
+                # files metadata
+                "directus_folders",
+                "directus_files",
+                # permissions/policies depending on version (attempt individually)
+                "directus_roles",
+                "directus_permissions",
+                "directus_policies",
+                "directus_access",
+                # UI presets and dashboards
+                "directus_presets",
+                "directus_dashboards",
+                "directus_panels",
+            ]
+            print("[PG] Migrating core directus_* tables (metadata and permissions)…")
+            core_result = run_pg_dump_selected_tables(
+                args.source_db_url, args.target_db_url, core_tables
+            )
+            print(
+                f"[PG] Migrated: {', '.join(core_result['migrated']) or 'none'}; "
+                f"Skipped (missing): {', '.join(core_result['skipped_missing']) or 'none'}"
+            )
+        except Exception as e:
+            print(f"[ERROR] pg_dump data migration failed: {e}")
+            sys.exit(1)
 
 
 if __name__ == "__main__":
